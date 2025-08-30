@@ -498,8 +498,8 @@ impl JailbreakDetector {
         if let Ok(output) = Command::new("netstat").args(&["-an"]).output() {
             let connections = String::from_utf8_lossy(&output.stdout);
             
-            // Check for Frida default ports
-            let frida_ports = ["27042", "27043", "27044"];
+            // Check for Frida default ports && other tools ports
+            let frida_ports = ["27042", "27043", "27044","8080","8081","8082","8888","8889","8000","9000","9090","23946","5555"];
             for port in frida_ports.iter() {
                 if connections.contains(port) {
                     return true;
