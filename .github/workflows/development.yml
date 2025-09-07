@@ -1,0 +1,171 @@
+name: Development Build
+
+on:
+  push:
+    branches: [ main, development ]
+  pull_request:
+    branches: [ main, development ]
+
+env:
+  CARGO_TERM_COLOR: always
+  LIBRARY_NAME: jailbreak_detection
+
+jobs:
+  test:
+    name: Test and Lint
+    runs-on: macos-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target/
+        key: ${{ runner.os }}-cargo-dev-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-dev-
+          ${{ runner.os }}-cargo-
+
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+
+    - name: Run clippy
+      run: |
+        rustup component add clippy
+        cargo clippy -- -D warnings
+
+    - name: Run tests
+      run: cargo test --verbose
+
+  build-dev:
+    name: Development Build
+    runs-on: macos-latest
+    needs: test
+    if: github.event_name == 'push'
+    
+    strategy:
+      matrix:
+        target:
+          - aarch64-apple-ios
+          - aarch64-apple-ios-sim
+          - x86_64-apple-ios
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+
+    - name: Cache Rust dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target/
+        key: ${{ runner.os }}-cargo-${{ matrix.target }}-dev-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-${{ matrix.target }}-dev-
+          ${{ runner.os }}-cargo-
+
+    - name: Build debug for ${{ matrix.target }}
+      run: cargo build --target ${{ matrix.target }}
+
+    - name: Build release for ${{ matrix.target }}
+      run: cargo build --target ${{ matrix.target }} --release
+
+    - name: Upload debug artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: ${{ matrix.target }}-debug-dev
+        path: target/${{ matrix.target }}/debug/lib${{ env.LIBRARY_NAME }}.a
+        retention-days: 7
+
+    - name: Upload release artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: ${{ matrix.target }}-release-dev
+        path: target/${{ matrix.target }}/release/lib${{ env.LIBRARY_NAME }}.a
+        retention-days: 7
+
+  create-dev-package:
+    name: Create Development Package
+    runs-on: macos-latest
+    needs: build-dev
+    if: github.event_name == 'push' && github.ref == 'refs/heads/development'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Create package directories
+      run: |
+        mkdir -p package/{debug,release}
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+      with:
+        path: artifacts/
+
+    - name: Create universal binaries and package
+      run: |
+        # Create universal iOS simulator binaries
+        lipo -create \
+          artifacts/aarch64-apple-ios-sim-release-dev/lib${{ env.LIBRARY_NAME }}.a \
+          artifacts/x86_64-apple-ios-release-dev/lib${{ env.LIBRARY_NAME }}.a \
+          -output package/release/lib${{ env.LIBRARY_NAME }}_simulator.a
+        
+        lipo -create \
+          artifacts/aarch64-apple-ios-sim-debug-dev/lib${{ env.LIBRARY_NAME }}.a \
+          artifacts/x86_64-apple-ios-debug-dev/lib${{ env.LIBRARY_NAME }}.a \
+          -output package/debug/lib${{ env.LIBRARY_NAME }}_simulator.a
+
+        # Copy iOS device binaries
+        cp artifacts/aarch64-apple-ios-release-dev/lib${{ env.LIBRARY_NAME }}.a package/release/lib${{ env.LIBRARY_NAME }}_ios.a
+        cp artifacts/aarch64-apple-ios-debug-dev/lib${{ env.LIBRARY_NAME }}.a package/debug/lib${{ env.LIBRARY_NAME }}_ios.a
+        
+        # Copy header files and examples
+        cp jailbreak_detection.h package/release/
+        cp jailbreak_detection.h package/debug/
+        cp -r Examples/ package/release/Examples/
+        cp -r Examples/ package/debug/Examples/
+        
+        # Create version files
+        echo "Version: Development Build" > package/release/VERSION
+        echo "Build Date: $(date)" >> package/release/VERSION
+        echo "Build Type: Release" >> package/release/VERSION
+        echo "Git Commit: ${{ github.sha }}" >> package/release/VERSION
+        echo "Branch: ${{ github.ref_name }}" >> package/release/VERSION
+        
+        echo "Version: Development Build" > package/debug/VERSION
+        echo "Build Date: $(date)" >> package/debug/VERSION
+        echo "Build Type: Debug" >> package/debug/VERSION
+        echo "Git Commit: ${{ github.sha }}" >> package/debug/VERSION
+        echo "Branch: ${{ github.ref_name }}" >> package/debug/VERSION
+
+    - name: Create development zip files
+      run: |
+        cd package/release && zip -r ../../${{ env.LIBRARY_NAME }}-dev-release.zip . && cd ../..
+        cd package/debug && zip -r ../../${{ env.LIBRARY_NAME }}-dev-debug.zip . && cd ../..
+
+    - name: Upload development packages
+      uses: actions/upload-artifact@v3
+      with:
+        name: development-packages
+        path: |
+          ${{ env.LIBRARY_NAME }}-dev-release.zip
+          ${{ env.LIBRARY_NAME }}-dev-debug.zip
+        retention-days: 30

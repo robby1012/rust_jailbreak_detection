@@ -1,0 +1,319 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g., v1.0.0)'
+        required: true
+        default: 'v0.1.0'
+
+env:
+  CARGO_TERM_COLOR: always
+  LIBRARY_NAME: jailbreak_detection
+
+jobs:
+  build:
+    name: Build iOS Libraries
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target:
+          - aarch64-apple-ios
+          - aarch64-apple-ios-sim
+          - x86_64-apple-ios
+        build_type: [debug, release]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+
+    - name: Cache Rust dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target/
+        key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-${{ matrix.target }}-
+          ${{ runner.os }}-cargo-
+
+    - name: Build for ${{ matrix.target }} (${{ matrix.build_type }})
+      run: |
+        if [ "${{ matrix.build_type }}" = "release" ]; then
+          cargo build --target ${{ matrix.target }} --release
+        else
+          cargo build --target ${{ matrix.target }}
+        fi
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: ${{ matrix.target }}-${{ matrix.build_type }}
+        path: target/${{ matrix.target }}/${{ matrix.build_type }}/lib${{ env.LIBRARY_NAME }}.a
+        retention-days: 1
+
+  create-universal-binaries:
+    name: Create Universal Binaries and Release Package
+    runs-on: macos-latest
+    needs: build
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Create release directories
+      run: |
+        mkdir -p release/{debug,release}
+        mkdir -p artifacts/{debug,release}
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+      with:
+        path: artifacts/
+
+    - name: Create universal iOS simulator binaries
+      run: |
+        # Release universal binary for simulator
+        lipo -create \
+          artifacts/aarch64-apple-ios-sim-release/lib${{ env.LIBRARY_NAME }}.a \
+          artifacts/x86_64-apple-ios-release/lib${{ env.LIBRARY_NAME }}.a \
+          -output release/release/lib${{ env.LIBRARY_NAME }}_simulator.a
+        
+        # Debug universal binary for simulator
+        lipo -create \
+          artifacts/aarch64-apple-ios-sim-debug/lib${{ env.LIBRARY_NAME }}.a \
+          artifacts/x86_64-apple-ios-debug/lib${{ env.LIBRARY_NAME }}.a \
+          -output release/debug/lib${{ env.LIBRARY_NAME }}_simulator.a
+
+    - name: Copy iOS device binaries and headers
+      run: |
+        # Copy iOS device binaries
+        cp artifacts/aarch64-apple-ios-release/lib${{ env.LIBRARY_NAME }}.a release/release/lib${{ env.LIBRARY_NAME }}_ios.a
+        cp artifacts/aarch64-apple-ios-debug/lib${{ env.LIBRARY_NAME }}.a release/debug/lib${{ env.LIBRARY_NAME }}_ios.a
+        
+        # Copy header files
+        cp jailbreak_detection.h release/release/
+        cp jailbreak_detection.h release/debug/
+
+    - name: Create version files
+      run: |
+        # Get version from tag or input
+        if [ "${{ github.event_name }}" = "push" ]; then
+          VERSION="${{ github.ref_name }}"
+        else
+          VERSION="${{ github.event.inputs.version }}"
+        fi
+        
+        # Create version files
+        echo "Version: $VERSION" > release/release/VERSION
+        echo "Build Date: $(date)" >> release/release/VERSION
+        echo "Build Type: Release" >> release/release/VERSION
+        echo "Targets: aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios" >> release/release/VERSION
+        echo "Git Commit: ${{ github.sha }}" >> release/release/VERSION
+        
+        echo "Version: $VERSION" > release/debug/VERSION
+        echo "Build Date: $(date)" >> release/debug/VERSION
+        echo "Build Type: Debug" >> release/debug/VERSION
+        echo "Targets: aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios" >> release/debug/VERSION
+        echo "Git Commit: ${{ github.sha }}" >> release/debug/VERSION
+
+    - name: Create integration examples
+      run: |
+        # Copy integration examples to both release and debug
+        cp -r Examples/ release/release/Examples/
+        cp -r Examples/ release/debug/Examples/
+
+    - name: Generate build reports
+      run: |
+        # Generate build reports
+        cat > release/release/BUILD_REPORT.md << 'EOF'
+        # Release Build Report - ${{ env.LIBRARY_NAME }}
+        
+        **Build Date:** $(date)
+        **Version:** ${{ github.ref_name || github.event.inputs.version }}
+        **Build Type:** Release
+        **Git Commit:** ${{ github.sha }}
+        
+        ## Libraries Included
+        
+        ### iOS Device (ARM64)
+        - **File:** lib${{ env.LIBRARY_NAME }}_ios.a
+        - **Target:** aarch64-apple-ios
+        - **Optimized:** Yes
+        
+        ### iOS Simulator (Universal)
+        - **File:** lib${{ env.LIBRARY_NAME }}_simulator.a
+        - **Targets:** aarch64-apple-ios-sim, x86_64-apple-ios
+        - **Optimized:** Yes
+        
+        ## Integration
+        
+        1. Add the appropriate `.a` file to your Xcode project
+        2. Include the `jailbreak_detection.h` header file
+        3. Check the `Examples/` directory for integration samples
+        4. Configure your Xcode project as shown in the example screenshots
+        
+        ## Files Included
+        
+        - `lib${{ env.LIBRARY_NAME }}_ios.a` - iOS device library
+        - `lib${{ env.LIBRARY_NAME }}_simulator.a` - iOS simulator library
+        - `jailbreak_detection.h` - C header file
+        - `Examples/` - Integration examples and Xcode configuration
+        - `VERSION` - Build version information
+        EOF
+        
+        cat > release/debug/BUILD_REPORT.md << 'EOF'
+        # Debug Build Report - ${{ env.LIBRARY_NAME }}
+        
+        **Build Date:** $(date)
+        **Version:** ${{ github.ref_name || github.event.inputs.version }}
+        **Build Type:** Debug
+        **Git Commit:** ${{ github.sha }}
+        
+        ## Libraries Included
+        
+        ### iOS Device (ARM64)
+        - **File:** lib${{ env.LIBRARY_NAME }}_ios.a
+        - **Target:** aarch64-apple-ios
+        - **Optimized:** No (Debug symbols included)
+        
+        ### iOS Simulator (Universal)
+        - **File:** lib${{ env.LIBRARY_NAME }}_simulator.a
+        - **Targets:** aarch64-apple-ios-sim, x86_64-apple-ios
+        - **Optimized:** No (Debug symbols included)
+        
+        ## Integration
+        
+        1. Add the appropriate `.a` file to your Xcode project
+        2. Include the `jailbreak_detection.h` header file
+        3. Check the `Examples/` directory for integration samples
+        4. Configure your Xcode project as shown in the example screenshots
+        
+        ## Debug Features
+        
+        - Debug symbols included for easier debugging
+        - Unoptimized code for better debugging experience
+        - Assertions enabled
+        
+        ## Files Included
+        
+        - `lib${{ env.LIBRARY_NAME }}_ios.a` - iOS device library (debug)
+        - `lib${{ env.LIBRARY_NAME }}_simulator.a` - iOS simulator library (debug)
+        - `jailbreak_detection.h` - C header file
+        - `Examples/` - Integration examples and Xcode configuration
+        - `VERSION` - Build version information
+        EOF
+
+    - name: Display library information
+      run: |
+        echo "=== Release Libraries ==="
+        ls -la release/release/
+        file release/release/*.a
+        
+        echo "=== Debug Libraries ==="
+        ls -la release/debug/
+        file release/debug/*.a
+
+    - name: Create release zip files
+      run: |
+        cd release/release && zip -r ../../${{ env.LIBRARY_NAME }}-release.zip . && cd ../..
+        cd release/debug && zip -r ../../${{ env.LIBRARY_NAME }}-debug.zip . && cd ../..
+        
+        # Create combined zip with both release and debug
+        mkdir -p combined
+        cp -r release/release combined/
+        cp -r release/debug combined/
+        cd combined && zip -r ../${{ env.LIBRARY_NAME }}-combined.zip . && cd ..
+
+    - name: Upload release artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: release-binaries
+        path: |
+          ${{ env.LIBRARY_NAME }}-release.zip
+          ${{ env.LIBRARY_NAME }}-debug.zip
+          ${{ env.LIBRARY_NAME }}-combined.zip
+
+    - name: Create GitHub Release
+      if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          ${{ env.LIBRARY_NAME }}-release.zip
+          ${{ env.LIBRARY_NAME }}-debug.zip
+          ${{ env.LIBRARY_NAME }}-combined.zip
+        name: Release ${{ github.ref_name }}
+        body: |
+          # ${{ env.LIBRARY_NAME }} ${{ github.ref_name }}
+          
+          ## Downloads
+          
+          - **${{ env.LIBRARY_NAME }}-release.zip** - Optimized release binaries
+          - **${{ env.LIBRARY_NAME }}-debug.zip** - Debug binaries with symbols
+          - **${{ env.LIBRARY_NAME }}-combined.zip** - Both release and debug binaries
+          
+          ## What's Included
+          
+          Each zip file contains:
+          - iOS device library (`lib${{ env.LIBRARY_NAME }}_ios.a`)
+          - iOS simulator universal library (`lib${{ env.LIBRARY_NAME }}_simulator.a`)
+          - C header file (`jailbreak_detection.h`)
+          - Integration examples and Xcode configuration
+          - Build information and version details
+          
+          ## Quick Start
+          
+          1. Download the appropriate zip file
+          2. Extract and add the `.a` files to your Xcode project
+          3. Include the header file in your project
+          4. Follow the integration examples in the `Examples/` directory
+          
+          Built from commit: ${{ github.sha }}
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  test:
+    name: Run Tests
+    runs-on: macos-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target/
+        key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-test-
+          ${{ runner.os }}-cargo-
+
+    - name: Run tests
+      run: cargo test --verbose
+
+    - name: Run clippy
+      run: |
+        rustup component add clippy
+        cargo clippy -- -D warnings

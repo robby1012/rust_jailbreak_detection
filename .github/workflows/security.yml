@@ -1,0 +1,316 @@
+name: Security and Quality Checks
+
+on:
+  push:
+    branches: [ main, development ]
+  pull_request:
+    branches: [ main, development ]
+  schedule:
+    # Run security checks weekly on Monday at 9 AM UTC
+    - cron: '0 9 * * 1'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  security-audit:
+    name: Security Audit
+    runs-on: macos-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target/
+        key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-audit-
+
+    - name: Install cargo-audit
+      run: cargo install cargo-audit
+
+    - name: Run security audit
+      run: cargo audit
+
+    - name: Check for unsafe code
+      run: |
+        echo "Checking for unsafe code blocks..."
+        unsafe_count=$(grep -r "unsafe" src/ | wc -l | tr -d ' ')
+        echo "Found $unsafe_count unsafe code blocks"
+        if [ "$unsafe_count" -gt 0 ]; then
+          echo "::warning::Found $unsafe_count unsafe code blocks:"
+          grep -r "unsafe" src/ || true
+        fi
+
+    - name: Check for debugging code
+      run: |
+        echo "Checking for debugging statements..."
+        debug_count=$(grep -r "println!\|dbg!\|eprintln!" src/ | wc -l | tr -d ' ')
+        echo "Found $debug_count debug statements"
+        if [ "$debug_count" -gt 0 ]; then
+          echo "::warning::Found $debug_count debug statements (should be removed for production):"
+          grep -r "println!\|dbg!\|eprintln!" src/ || true
+        fi
+
+  code-quality:
+    name: Code Quality
+    runs-on: macos-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+
+    - name: Cache Rust dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target/
+        key: ${{ runner.os }}-cargo-quality-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-quality-
+
+    - name: Check code formatting
+      run: cargo fmt --all -- --check
+
+    - name: Run clippy with strict settings
+      run: |
+        cargo clippy --all-targets --all-features -- \
+          -D warnings \
+          -D clippy::all \
+          -D clippy::pedantic \
+          -D clippy::nursery \
+          -A clippy::missing_docs_in_private_items \
+          -A clippy::module_name_repetitions
+
+    - name: Check documentation
+      run: |
+        cargo doc --no-deps --document-private-items
+      env:
+        RUSTDOCFLAGS: "-D warnings"
+
+  dependency-check:
+    name: Dependency Analysis
+    runs-on: macos-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install cargo-machete
+      run: cargo install cargo-machete
+
+    - name: Check for unused dependencies
+      run: cargo machete
+
+    - name: Install cargo-outdated
+      run: cargo install cargo-outdated
+
+    - name: Check for outdated dependencies
+      run: cargo outdated
+
+    - name: Generate dependency report
+      run: |
+        echo "# Dependency Report" > dependency_report.md
+        echo "" >> dependency_report.md
+        echo "## Current Dependencies" >> dependency_report.md
+        echo "\`\`\`toml" >> dependency_report.md
+        grep -A 20 "\[dependencies\]" Cargo.toml >> dependency_report.md
+        echo "\`\`\`" >> dependency_report.md
+        echo "" >> dependency_report.md
+        echo "## Dependency Tree" >> dependency_report.md
+        echo "\`\`\`" >> dependency_report.md
+        cargo tree >> dependency_report.md
+        echo "\`\`\`" >> dependency_report.md
+
+    - name: Upload dependency report
+      uses: actions/upload-artifact@v3
+      with:
+        name: dependency-report
+        path: dependency_report.md
+        retention-days: 30
+
+  build-validation:
+    name: Build Validation
+    runs-on: macos-latest
+    
+    strategy:
+      matrix:
+        target:
+          - aarch64-apple-ios
+          - aarch64-apple-ios-sim
+          - x86_64-apple-ios
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+
+    - name: Cache Rust dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target/
+        key: ${{ runner.os }}-cargo-validation-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-validation-${{ matrix.target }}-
+
+    - name: Build and validate ${{ matrix.target }}
+      run: |
+        echo "Building for ${{ matrix.target }}..."
+        cargo build --target ${{ matrix.target }} --release
+        
+        # Check that the library was created
+        lib_path="target/${{ matrix.target }}/release/libjailbreak_detection.a"
+        if [ -f "$lib_path" ]; then
+          echo "✅ Library created successfully: $lib_path"
+          echo "📊 Library size: $(ls -lh "$lib_path" | awk '{print $5}')"
+          echo "🔍 Library info:"
+          file "$lib_path"
+        else
+          echo "❌ Library not found at: $lib_path"
+          exit 1
+        fi
+
+    - name: Validate library symbols
+      run: |
+        lib_path="target/${{ matrix.target }}/release/libjailbreak_detection.a"
+        echo "🔍 Checking library symbols..."
+        nm "$lib_path" | head -20
+        
+        # Check for expected symbols (adjust based on your exported functions)
+        if nm "$lib_path" | grep -q "_"; then
+          echo "✅ Library contains expected symbols"
+        else
+          echo "⚠️  No symbols found in library"
+        fi
+
+  performance-check:
+    name: Performance Analysis
+    runs-on: macos-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target/
+        key: ${{ runner.os }}-cargo-perf-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-perf-
+
+    - name: Install cargo-bloat
+      run: cargo install cargo-bloat
+
+    - name: Analyze binary size
+      run: |
+        echo "🔍 Analyzing binary size..."
+        cargo bloat --release --target aarch64-apple-ios
+
+    - name: Run benchmarks (if available)
+      run: |
+        if grep -q "\[\[bench\]\]" Cargo.toml; then
+          echo "🏃 Running benchmarks..."
+          cargo bench
+        else
+          echo "ℹ️  No benchmarks configured"
+        fi
+      continue-on-error: true
+
+  supply-chain-security:
+    name: Supply Chain Security
+    runs-on: macos-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install cargo-deny
+      run: cargo install cargo-deny
+
+    - name: Check licenses and security
+      run: |
+        # Create a basic deny.toml if it doesn't exist
+        if [ ! -f "deny.toml" ]; then
+          cat > deny.toml << 'EOF'
+        [licenses]
+        allow = [
+            "MIT",
+            "Apache-2.0",
+            "Apache-2.0 WITH LLVM-exception",
+            "BSD-2-Clause",
+            "BSD-3-Clause",
+            "ISC",
+            "Unicode-DFS-2016",
+        ]
+
+        [bans]
+        multiple-versions = "warn"
+        wildcards = "warn"
+
+        [advisories]
+        vulnerability = "deny"
+        unmaintained = "warn"
+        yanked = "deny"
+        notice = "warn"
+        EOF
+        fi
+        
+        cargo deny check
+
+    - name: Generate security report
+      run: |
+        echo "# Security Analysis Report" > security_report.md
+        echo "" >> security_report.md
+        echo "Generated on: $(date)" >> security_report.md
+        echo "" >> security_report.md
+        echo "## License Analysis" >> security_report.md
+        echo "\`\`\`" >> security_report.md
+        cargo deny list >> security_report.md
+        echo "\`\`\`" >> security_report.md
+
+    - name: Upload security report
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-report
+        path: security_report.md
+        retention-days: 30
